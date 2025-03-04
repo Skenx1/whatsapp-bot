@@ -1,4 +1,4 @@
-echo '{
+{
   "name": "whatsapp-bot",
   "version": "1.0.0",
   "description": "WhatsApp Bot using Baileys",
@@ -16,4 +16,4 @@ echo '{
   "engines": {
     "node": ">=14.0.0"
   }
-}' > package.json
+}
