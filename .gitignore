@@ -1,0 +1,3 @@
+echo 'node_modules
+auth
+bot_db.json' > .gitignore
