@@ -1,14 +1,44 @@
-const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys")
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, makeInMemoryStore } = require("@whiskeysockets/baileys")
 const { Boom } = require("@hapi/boom")
 const fs = require("fs")
 const path = require("path")
+const pino = require("pino")
 const qrcode = require("qrcode-terminal")
-const figlet = require("figlet")
-const chalk = require("chalk")
+const express = require("express")
+const NodeCache = require("node-cache")
+const readline = require("readline")
 
-// Simple database to store user data and statuses
+// Create Express app for keeping Render alive
+const app = express()
+const PORT = process.env.PORT || 3000
+
+// Simple database to store user data
 const DB_FILE = "bot_db.json"
-let db = { warned: {}, statuses: {} }
+let db = { warned: {} }
+
+// Improved caching for better performance
+const msgRetryCounterCache = new NodeCache()
+// Create a store to cache messages (improves performance)
+const store = makeInMemoryStore({ 
+  logger: pino({ level: 'silent' }) 
+})
+
+// Create a silent logger to prevent terminal spam
+const logger = pino({ 
+  level: 'silent',  // Set to 'silent' to disable all logs
+  transport: {
+    target: 'pino-pretty',
+    options: {
+      colorize: true,
+      ignore: 'pid,hostname',
+    },
+  },
+})
+
+// Create auth state directory if it doesn't exist
+if (!fs.existsSync('./auth')) {
+  fs.mkdirSync('./auth')
+}
 
 // Load database if exists
 if (fs.existsSync(DB_FILE)) {
@@ -19,14 +49,13 @@ if (fs.existsSync(DB_FILE)) {
   }
 }
 
-// Save database
+// Save database with error handling
 function saveDB() {
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2))
-}
-
-// Fancy console log
-function fancyLog(text) {
-  console.log(chalk.cyan(figlet.textSync(text, { font: "Small" })))
+  try {
+    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2))
+  } catch (error) {
+    console.error("Error saving database:", error)
+  }
 }
 
 // Command handler
@@ -39,30 +68,23 @@ async function handleCommand(sock, msg, from, sender, groupMetadata, text) {
   // Help command
   if (command === "help") {
     const commands = [
-      "*🌟 Available Commands 🌟*",
+      "*Available Commands:*",
       "",
-      "*📚 General Commands:*",
+      "*General Commands:*",
       "• !help - Show this help message",
       "• !ping - Check if bot is online",
       "• !groupinfo - Show group information",
       "• !tagall [message] - Tag all members",
       "• !warn @user - Warn a user",
       "• !unwarn @user - Remove warning from a user",
-      "• !savequote [text] - Save a quote",
-      "• !getquote - Get a random saved quote",
-      "• !weather [city] - Get weather information",
-      "• !joke - Get a random joke",
-      "• !flip - Flip a coin",
-      "• !roll [number] - Roll a dice",
-      "• !calculate [expression] - Calculate a mathematical expression",
       "",
-      "*👑 Admin Commands:*",
+      "*Admin Commands:*",
       "• !kick @user - Remove a user from group",
       "• !add number - Add a user to group",
       "• !broadcast message - Send a broadcast message",
       "• !restart - Restart the bot",
       "",
-      "Note: Replace @user with an actual mention, and [text] with appropriate content.",
+      "Note: Replace @user with an actual mention, and [message] or number with the appropriate text.",
       "Admin commands can only be used by group admins.",
     ].join("\n")
 
@@ -71,20 +93,18 @@ async function handleCommand(sock, msg, from, sender, groupMetadata, text) {
 
   // Ping command
   if (command === "ping") {
-    return sock.sendMessage(from, { text: "Pong! 🏓 Bot is online and ready!" }, { quoted: msg })
+    return sock.sendMessage(from, { text: "Pong! 🏓" }, { quoted: msg })
   }
 
   // Group info command
   if (command === "groupinfo" && groupMetadata) {
     const info = [
-      `*📊 Group Information 📊*`,
-      ``,
-      `*🏷️ Name:* ${groupMetadata.subject}`,
-      `*🆔 ID:* ${from}`,
-      `*👑 Created By:* ${groupMetadata.owner || "Unknown"}`,
-      `*📅 Created On:* ${new Date(groupMetadata.creation * 1000).toLocaleString()}`,
-      `*👥 Member Count:* ${groupMetadata.participants.length}`,
-      `*📝 Description:* ${groupMetadata.desc || "No description"}`,
+      `*Group Name:* ${groupMetadata.subject}`,
+      `*Group ID:* ${from}`,
+      `*Created By:* ${groupMetadata.owner || "Unknown"}`,
+      `*Created On:* ${new Date(groupMetadata.creation * 1000).toLocaleString()}`,
+      `*Member Count:* ${groupMetadata.participants.length}`,
+      `*Description:* ${groupMetadata.desc || "No description"}`,
     ].join("\n")
 
     return sock.sendMessage(from, { text: info }, { quoted: msg })
@@ -96,10 +116,10 @@ async function handleCommand(sock, msg, from, sender, groupMetadata, text) {
       return sock.sendMessage(from, { text: "This command can only be used in groups!" }, { quoted: msg })
     }
 
-    const message = args.slice(1).join(" ") || "Hello everyone!"
+    const message = args.slice(1).join(" ") || "ShabX 6x6y Bot"
     const mentions = groupMetadata.participants.map((participant) => participant.id)
 
-    let text = `*📢 Attention Everyone! 📢*\n\n${message}\n\n`
+    let text = `*${message}*\n\n`
     for (const participant of groupMetadata.participants) {
       text += `@${participant.id.split("@")[0]}\n`
     }
@@ -132,7 +152,7 @@ async function handleCommand(sock, msg, from, sender, groupMetadata, text) {
     return sock.sendMessage(
       from,
       {
-        text: `⚠️ @${targetUser.split("@")[0]} has been warned! (${db.warned[targetUser]} warnings)`,
+        text: `@${targetUser.split("@")[0]} has been warned! (${db.warned[targetUser]} warnings)`,
         mentions: [targetUser],
       },
       { quoted: msg },
@@ -158,91 +178,11 @@ async function handleCommand(sock, msg, from, sender, groupMetadata, text) {
     return sock.sendMessage(
       from,
       {
-        text: `✅ Warning removed from @${targetUser.split("@")[0]}!`,
+        text: `Warning removed from @${targetUser.split("@")[0]}!`,
         mentions: [targetUser],
       },
       { quoted: msg },
     )
-  }
-
-  // Save quote command
-  if (command === "savequote") {
-    const quote = args.slice(1).join(" ")
-    if (!quote) {
-      return sock.sendMessage(from, { text: "Please provide a quote to save!" }, { quoted: msg })
-    }
-
-    if (!db.statuses[from]) {
-      db.statuses[from] = []
-    }
-    db.statuses[from].push(quote)
-    saveDB()
-
-    return sock.sendMessage(from, { text: "✅ Quote saved successfully!" }, { quoted: msg })
-  }
-
-  // Get quote command
-  if (command === "getquote") {
-    if (!db.statuses[from] || db.statuses[from].length === 0) {
-      return sock.sendMessage(from, { text: "No quotes saved for this group!" }, { quoted: msg })
-    }
-
-    const randomQuote = db.statuses[from][Math.floor(Math.random() * db.statuses[from].length)]
-    return sock.sendMessage(from, { text: `📜 Random Quote:\n\n"${randomQuote}"` }, { quoted: msg })
-  }
-
-  // Weather command (Note: This is a mock implementation)
-  if (command === "weather") {
-    const city = args.slice(1).join(" ")
-    if (!city) {
-      return sock.sendMessage(from, { text: "Please provide a city name!" }, { quoted: msg })
-    }
-
-    const mockWeather = ["Sunny", "Cloudy", "Rainy", "Windy", "Snowy"][Math.floor(Math.random() * 5)]
-    const mockTemp = Math.floor(Math.random() * 35) + 5 // Random temperature between 5°C and 40°C
-
-    return sock.sendMessage(from, { text: `🌤️ Weather in ${city}:\n${mockWeather}, ${mockTemp}°C` }, { quoted: msg })
-  }
-
-  // Joke command
-  if (command === "joke") {
-    const jokes = [
-      "Why don't scientists trust atoms? Because they make up everything!",
-      "Why did the scarecrow win an award? He was outstanding in his field!",
-      "Why don't eggs tell jokes? They'd crack each other up!",
-      "Why don't skeletons fight each other? They don't have the guts!",
-      "What do you call a fake noodle? An impasta!",
-    ]
-    const randomJoke = jokes[Math.floor(Math.random() * jokes.length)]
-    return sock.sendMessage(from, { text: `😂 Here's a joke:\n\n${randomJoke}` }, { quoted: msg })
-  }
-
-  // Flip coin command
-  if (command === "flip") {
-    const result = Math.random() < 0.5 ? "Heads" : "Tails"
-    return sock.sendMessage(from, { text: `🪙 Coin flip result: ${result}` }, { quoted: msg })
-  }
-
-  // Roll dice command
-  if (command === "roll") {
-    const sides = Number.parseInt(args[1]) || 6
-    const result = Math.floor(Math.random() * sides) + 1
-    return sock.sendMessage(from, { text: `🎲 Dice roll result (${sides}-sided): ${result}` }, { quoted: msg })
-  }
-
-  // Calculate command
-  if (command === "calculate") {
-    const expression = args.slice(1).join(" ")
-    if (!expression) {
-      return sock.sendMessage(from, { text: "Please provide a mathematical expression!" }, { quoted: msg })
-    }
-
-    try {
-      const result = eval(expression)
-      return sock.sendMessage(from, { text: `🧮 Result: ${expression} = ${result}` }, { quoted: msg })
-    } catch (error) {
-      return sock.sendMessage(from, { text: "Invalid expression. Please try again." }, { quoted: msg })
-    }
   }
 
   // Admin commands
@@ -270,7 +210,7 @@ async function handleCommand(sock, msg, from, sender, groupMetadata, text) {
         return sock.sendMessage(
           from,
           {
-            text: `👢 @${targetUser.split("@")[0]} has been kicked from the group!`,
+            text: `@${targetUser.split("@")[0]} has been kicked from the group!`,
             mentions: [targetUser],
           },
           { quoted: msg },
@@ -300,7 +240,7 @@ async function handleCommand(sock, msg, from, sender, groupMetadata, text) {
 
       try {
         await sock.groupParticipantsUpdate(from, [number], "add")
-        return sock.sendMessage(from, { text: `✅ User ${args[1]} has been added to the group!` }, { quoted: msg })
+        return sock.sendMessage(from, { text: `User ${args[1]} has been added to the group!` }, { quoted: msg })
       } catch (error) {
         return sock.sendMessage(from, { text: "Failed to add user: " + error.message }, { quoted: msg })
       }
@@ -314,126 +254,415 @@ async function handleCommand(sock, msg, from, sender, groupMetadata, text) {
       }
 
       return sock.sendMessage(from, {
-        text: `*📢 BROADCAST*\n\n${message}`,
+        text: `*BROADCAST*\n\n${message}`,
       })
     }
 
     // Restart command
     if (command === "restart") {
-      sock.sendMessage(from, { text: "🔄 Restarting bot..." }, { quoted: msg }).then(() => process.exit(0))
+      sock.sendMessage(from, { text: "Restarting bot..." }, { quoted: msg }).then(() => {
+        console.log("Restarting bot by user command...")
+        process.exit(0) // Render will automatically restart the process
+      })
     }
   }
 }
 
-let sock // Declare sock outside startBot
+// Global socket variable
+let sock = null
+let connectionTimeout = null
 
-async function startBot() {
-  // Create auth state
-  const { state, saveCreds } = await useMultiFileAuthState("auth")
-
-  // Create socket connection
-  sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: true,
-    defaultQueryTimeoutMs: 60000, // Increase timeout for slow connections
-    qrTimeout: 60000, // Add this line to increase QR code timeout
+// Function to create a smaller QR code
+function generateSmallQR(qr) {
+  // Clear console to make QR code more visible
+  console.clear()
+  console.log("\n=== SCAN THIS QR CODE TO LOGIN ===\n")
+  
+  // Generate a tiny QR code
+  qrcode.generate(qr, { 
+    small: true,
+    scale: 1  // Smallest possible scale
   })
-
-  // Save credentials when updated
-  sock.ev.on("creds.update", saveCreds)
-
-  // Handle connection updates
-  sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
-    if (qr) {
-      qrcode.generate(qr, { small: true }) // Generate smaller QR code
-    }
-    if (connection === "close") {
-      const shouldReconnect =
-        lastDisconnect?.error instanceof Boom && lastDisconnect.error.output?.statusCode !== DisconnectReason.loggedOut
-
-      console.log("Connection closed due to ", lastDisconnect?.error, ", reconnecting:", shouldReconnect)
-
-      if (shouldReconnect) {
-        startBot()
-      }
-    } else if (connection === "open") {
-      fancyLog("Bot Connected!")
-    }
-  })
-
-  // Handle messages
-  sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    try {
-      const msg = messages[0]
-      if (!msg.message) return
-
-      const from = msg.key.remoteJid
-      const isGroup = from.endsWith("@g.us")
-      const sender = msg.key.participant || from
-
-      // Get message content
-      const messageType = Object.keys(msg.message)[0]
-      const body = (
-        msg.message.conversation ||
-        msg.message.extendedTextMessage?.text ||
-        msg.message.imageMessage?.caption ||
-        msg.message.videoMessage?.caption ||
-        ""
-      ).trim()
-
-      // Handle group-specific actions
-      let groupMetadata = null
-      if (isGroup) {
-        groupMetadata = await sock.groupMetadata(from)
-
-        // Handle commands
-        if (body.startsWith("!")) {
-          const text = body.slice(1)
-          return await handleCommand(sock, msg, from, sender, groupMetadata, text)
-        }
-      }
-
-      // Log message for debugging
-      console.log(chalk.green(`[${new Date().toLocaleString()}] Message from ${sender} in ${from}: ${body}`))
-    } catch (error) {
-      console.error("Error processing message:", error)
-    }
-  })
-
-  // Handle group participants update (joins/leaves)
-  sock.ev.on("group-participants.update", async ({ id, participants, action }) => {
-    try {
-      // Get group metadata
-      const groupMetadata = await sock.groupMetadata(id)
-
-      // Handle new participants
-      if (action === "add") {
-        for (const participant of participants) {
-          // Send welcome message
-          sock.sendMessage(id, {
-            text: `👋 Welcome @${participant.split("@")[0]} to ${groupMetadata.subject}!`,
-            mentions: [participant],
-          })
-        }
-      }
-
-      // Handle participants who left
-      if (action === "remove") {
-        for (const participant of participants) {
-          // Send goodbye message
-          sock.sendMessage(id, {
-            text: `👋 @${participant.split("@")[0]} has left the group. Goodbye!`,
-            mentions: [participant],
-          })
-        }
-      }
-    } catch (error) {
-      console.error("Error handling group update:", error)
-    }
-  })
+  
+  console.log("\n=== SCAN ABOVE QR CODE TO LOGIN ===\n")
 }
 
-// Start the bot
-fancyLog("Starting WhatsApp Bot")
-startBot()
+// Function to handle pairing code authentication
+async function pairWithCode(sock, phoneNumber) {
+  try {
+    // Request pairing code for the phone number
+    const code = await sock.requestPairingCode(phoneNumber)
+    console.log(`\n=== PAIRING CODE ===\n${code}\n=== ENTER THIS CODE ON YOUR WHATSAPP ===\n`)
+    
+    // Instructions for the user
+    console.log("1. Open WhatsApp on your phone")
+    console.log("2. Tap Menu or Settings and select Linked Devices")
+    console.log("3. Tap on 'Link a Device'")
+    console.log("4. When prompted for a QR code scan, tap 'Link with phone number instead'")
+    console.log(`5. Enter your phone number and then the pairing code: ${code}`)
+    
+    return code
+  } catch (error) {
+    console.error("Error requesting pairing code:", error)
+    return null
+  }
+}
 
+// Function to handle connection retries with exponential backoff
+async function connectWithRetry(retryCount = 0) {
+  try {
+    await startBot()
+  } catch (error) {
+    const delay = Math.min(Math.pow(2, retryCount) * 1000, 60000) // Max 1 minute delay
+    console.log(`Connection attempt failed. Retrying in ${delay/1000} seconds...`)
+    setTimeout(() => connectWithRetry(retryCount + 1), delay)
+  }
+}
+
+// Main bot function with improved error handling
+async function startBot() {
+  try {
+    // Fetch the latest version of Baileys
+    const { version } = await fetchLatestBaileysVersion()
+    
+    // Create auth state with better error handling
+    const { state, saveCreds } = await useMultiFileAuthState("auth")
+    
+    // Create socket connection with improved settings
+    sock = makeWASocket({
+      version,
+      auth: {
+        creds: state.creds,
+        // Use caching for better performance
+        keys: makeCacheableSignalKeyStore(state.keys, logger),
+      },
+      printQRInTerminal: false, // We'll handle QR code display ourselves
+      logger,
+      msgRetryCounterCache,
+      defaultQueryTimeoutMs: 30000, // Reduced timeout for faster response
+      connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 25000, // Keep connection alive
+      emitOwnEvents: true, // For better event handling
+      browser: ['WhatsApp Bot', 'Chrome', '103.0.5060.114'], // More stable browser signature
+      markOnlineOnConnect: true, // Mark as online when connected
+      syncFullHistory: false, // Don't sync full history for faster startup
+      generateHighQualityLinkPreview: false, // Disable link previews for better performance
+      transactionOpts: { maxCommitRetries: 10, delayBetweenTriesMs: 3000 }, // More reliable transactions
+      getMessage: async (key) => {
+        // Get message from store to reduce server requests
+        if (store) {
+          const msg = await store.loadMessage(key.remoteJid, key.id)
+          return msg?.message || undefined
+        }
+        return { conversation: '' }
+      }
+    })
+    
+    // Bind the store to the socket
+    store.bind(sock.ev)
+
+    // Save credentials when updated
+    sock.ev.on("creds.update", saveCreds)
+
+    // Handle connection updates with improved error handling
+    sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
+      // Clear any existing connection timeout
+      if (connectionTimeout) {
+        clearTimeout(connectionTimeout)
+        connectionTimeout = null
+      }
+      
+      // Handle QR code with smaller display
+      if (qr) {
+        generateSmallQR(qr)
+        
+        // Also try pairing code method if QR is shown
+        // This is a fallback in case the user wants to use pairing code instead
+        console.log("\nIf QR code is not scanning well, you can use the pairing code method.")
+        console.log("Visit the web interface and enter your phone number to get a pairing code.")
+      }
+      
+      // Handle connection status
+      if (connection === "close") {
+        const statusCode = lastDisconnect?.error?.output?.statusCode
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut
+        
+        if (shouldReconnect) {
+          console.log("Reconnecting...")
+          connectWithRetry()
+        } else if (statusCode === DisconnectReason.loggedOut) {
+          console.log("Logged out. Please authenticate again.")
+          // Delete auth folder to force new login
+          try {
+            fs.rmSync('./auth', { recursive: true, force: true })
+            fs.mkdirSync('./auth')
+          } catch (error) {
+            console.error("Error resetting auth:", error)
+          }
+          connectWithRetry()
+        }
+      } else if (connection === "open") {
+        console.log("Bot connected successfully!")
+      }
+    })
+
+    // Handle messages with improved error handling and NO console logging
+    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+      try {
+        if (!messages || !messages[0]) return
+        
+        const msg = messages[0]
+        if (!msg.message) return
+
+        const from = msg.key.remoteJid
+        if (!from) return
+        
+        const isGroup = from.endsWith("@g.us")
+        const sender = msg.key.participant || from
+
+        // Get message content
+        const body = (
+          msg.message.conversation ||
+          msg.message.extendedTextMessage?.text ||
+          msg.message.imageMessage?.caption ||
+          msg.message.videoMessage?.caption ||
+          ""
+        ).trim()
+
+        // Handle group-specific actions
+        let groupMetadata = null
+        if (isGroup) {
+          try {
+            groupMetadata = await sock.groupMetadata(from)
+          } catch (error) {
+            // Silent error handling
+          }
+
+          // Handle commands
+          if (body.startsWith("!")) {
+            const text = body.slice(1)
+            return await handleCommand(sock, msg, from, sender, groupMetadata, text)
+          }
+        }
+        
+        // No console logging of messages
+      } catch (error) {
+        // Silent error handling
+      }
+    })
+
+    // Handle group participants update (joins/leaves)
+    sock.ev.on("group-participants.update", async ({ id, participants, action }) => {
+      try {
+        // Get group metadata
+        const groupMetadata = await sock.groupMetadata(id)
+
+        // Handle new participants
+        if (action === "add") {
+          for (const participant of participants) {
+            // Send welcome message
+            sock.sendMessage(id, {
+              text: `Welcome @${participant.split("@")[0]} to ${groupMetadata.subject}! 👋`,
+              mentions: [participant],
+            })
+          }
+        }
+
+        // Handle participants who left
+        if (action === "remove") {
+          for (const participant of participants) {
+            // Send goodbye message
+            sock.sendMessage(id, {
+              text: `@${participant.split("@")[0]} has left the group. Goodbye! 👋`,
+              mentions: [participant],
+            })
+          }
+        }
+      } catch (error) {
+        // Silent error handling
+      }
+    })
+
+    // Set up a watchdog timer to detect and fix connection issues
+    connectionTimeout = setTimeout(() => {
+      if (sock) {
+        sock.end()
+        connectWithRetry()
+      }
+    }, 60000) // 1 minute timeout
+    
+    return sock
+  } catch (error) {
+    console.error("Fatal error starting bot:", error)
+    throw error // Rethrow for retry mechanism
+  }
+}
+
+// Create readline interface for pairing code input
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout
+})
+
+// Set up Express server with pairing code functionality
+app.use(express.json())
+app.use(express.urlencoded({ extended: true }))
+
+app.get('/', (req, res) => {
+  const status = sock?.user ? 'Connected as ' + sock.user.name : 'Connecting...'
+  res.send(`
+    <html>
+      <head>
+        <title>WhatsApp Bot Status</title>
+        <meta http-equiv="refresh" content="30">
+        <style>
+          body { font-family: Arial, sans-serif; margin: 0; padding: 20px; line-height: 1.6; background-color: #f5f5f5; }
+          .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+          .status { padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+          .online { background-color: #d4edda; color: #155724; }
+          .offline { background-color: #f8d7da; color: #721c24; }
+          .info { background-color: #d1ecf1; color: #0c5460; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+          .form-group { margin-bottom: 15px; }
+          label { display: block; margin-bottom: 5px; font-weight: bold; }
+          input[type="text"] { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+          button { background-color: #4CAF50; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; }
+          button:hover { background-color: #45a049; }
+          .qr-info { background-color: #fff3cd; color: #856404; padding: 15px; border-radius: 5px; margin-top: 20px; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <h1>WhatsApp Bot Status</h1>
+          <div class="status ${sock?.user ? 'online' : 'offline'}">
+            <strong>Status:</strong> ${status}
+          </div>
+          
+          <div class="info">
+            <p>This page refreshes automatically every 30 seconds.</p>
+            <p>Last checked: ${new Date().toLocaleString()}</p>
+          </div>
+          
+          ${!sock?.user ? `
+          <div class="pairing">
+            <h2>Connect with Pairing Code</h2>
+            <p>If QR code scanning is difficult, you can use a pairing code instead:</p>
+            
+            <form action="/pair" method="post">
+              <div class="form-group">
+                <label for="phoneNumber">Your Phone Number (with country code):</label>
+                <input type="text" id="phoneNumber" name="phoneNumber" placeholder="e.g. +1234567890" required>
+              </div>
+              <button type="submit">Get Pairing Code</button>
+            </form>
+            
+            <div class="qr-info">
+              <p>If you prefer to scan a QR code, check the console logs in your Render dashboard.</p>
+            </div>
+          </div>
+          ` : ''}
+        </div>
+      </body>
+    </html>
+  `)
+})
+
+// Endpoint to handle pairing code requests
+app.post('/pair', async (req, res) => {
+  const { phoneNumber } = req.body
+  
+  if (!phoneNumber) {
+    return res.status(400).send('Phone number is required')
+  }
+  
+  // Format phone number (remove spaces, make sure it has + prefix)
+  const formattedNumber = phoneNumber.replace(/\s+/g, '').startsWith('+') 
+    ? phoneNumber.replace(/\s+/g, '') 
+    : '+' + phoneNumber.replace(/\s+/g, '')
+  
+  try {
+    if (!sock) {
+      return res.status(500).send('Bot is not initialized yet. Please try again in a few moments.')
+    }
+    
+    const code = await pairWithCode(sock, formattedNumber)
+    
+    if (code) {
+      res.send(`
+        <html>
+          <head>
+            <title>WhatsApp Pairing Code</title>
+            <style>
+              body { font-family: Arial, sans-serif; margin: 0; padding: 20px; line-height: 1.6; background-color: #f5f5f5; }
+              .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+              .code { font-size: 32px; letter-spacing: 5px; text-align: center; margin: 20px 0; font-weight: bold; }
+              .steps { background-color: #d1ecf1; color: #0c5460; padding: 15px; border-radius: 5px; margin: 20px 0; }
+              .steps ol { margin-left: 20px; }
+              .back { display: inline-block; margin-top: 20px; color: #0366d6; text-decoration: none; }
+              .back:hover { text-decoration: underline; }
+            </style>
+          </head>
+          <body>
+            <div class="container">
+              <h1>WhatsApp Pairing Code</h1>
+              <p>Use this code to link your WhatsApp account:</p>
+              
+              <div class="code">${code}</div>
+              
+              <div class="steps">
+                <h3>How to use this code:</h3>
+                <ol>
+                  <li>Open WhatsApp on your phone</li>
+                  <li>Tap Menu or Settings and select <strong>Linked Devices</strong></li>
+                  <li>Tap on <strong>Link a Device</strong></li>
+                  <li>When prompted for a QR code scan, tap <strong>Link with phone number instead</strong></li>
+                  <li>Enter your phone number and then the pairing code shown above</li>
+                </ol>
+              </div>
+              
+              <a href="/" class="back">← Back to Status Page</a>
+            </div>
+          </body>
+        </html>
+      `)
+    } else {
+      res.status(500).send('Failed to generate pairing code. Please try again.')
+    }
+  } catch (error) {
+    console.error('Error generating pairing code:', error)
+    res.status(500).send('An error occurred while generating the pairing code. Please try again.')
+  }
+})
+
+// Start the Express server
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`)
+})
+
+// Handle process termination gracefully
+process.on('SIGINT', () => {
+  console.log('Shutting down gracefully...')
+  if (sock) sock.end()
+  process.exit(0)
+})
+
+process.on('SIGTERM', () => {
+  console.log('Received SIGTERM, shutting down gracefully...')
+  if (sock) sock.end()
+  process.exit(0)
+})
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err)
+  // Don't exit, just log the error
+})
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason)
+  // Don't exit, just log the error
+})
+
+// Start the bot
+console.log("Starting WhatsApp Bot...")
+connectWithRetry()
